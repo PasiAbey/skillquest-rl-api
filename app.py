@@ -621,6 +621,8 @@ def save_model():
 # ==========================================
 # RUN THE SERVER
 # ==========================================
+# Note: This block is only used for local development (python app.py)
+# Production deployments use gunicorn (see Procfile)
 if __name__ == '__main__':
     print("\n" + "=" * 50)
     print("📡 API Endpoints:")
