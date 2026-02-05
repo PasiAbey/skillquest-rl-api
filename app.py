@@ -621,6 +621,8 @@ def save_model():
 # ==========================================
 # RUN THE SERVER
 # ==========================================
+# Note: This block is only used for local development (python app.py)
+# Production deployments use gunicorn (see Procfile)
 if __name__ == '__main__':
     print("\n" + "=" * 50)
     print("📡 API Endpoints:")
@@ -636,4 +638,5 @@ if __name__ == '__main__':
     print("\n🌐 Starting server at http://localhost:5000")
     print("=" * 50 + "\n")
     
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
