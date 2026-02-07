@@ -1,8 +1,8 @@
 # ==========================================
 # SKILLQUEST RL API - SINGLE FILE VERSION
 # ==========================================
-# Just run: python app.py
-# API will be available at: http://localhost:5000
+# Run locally: python app.py
+# API will be available at: http://localhost:8000
 # ==========================================
 
 from flask import Flask, request, jsonify
@@ -17,51 +17,30 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 import os
 
+# NEW: imports for recommendation correlation, timeouts, and threading
+import uuid
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
 # ==========================================
 # FLASK APP SETUP
 # ==========================================
 app = Flask(__name__)
 CORS(app)  # Allow all origins (for development)
 
+# Optional API key protection for write endpoints (feedback/save)
+API_KEY = os.getenv("API_KEY")  # set in Azure as a secret if you want to restrict feedback
+
 # ==========================================
 # ACTION SPACE DEFINITION
 # ==========================================
 ACTION_SPACE = {
-    0: {
-        "id": 0,
-        "code": "STANDARD_XP",
-        "name": "Standard XP",
-        "description": "Award normal XP points for activity",
-        "target": "all_students"
-    },
-    1: {
-        "id": 1,
-        "code": "MULTIPLIER_BOOST",
-        "name": "Multiplier Boost",
-        "description": "Apply XP multiplier (e.g., 2x, 3x) for next activity",
-        "target": "all_students"
-    },
-    2: {
-        "id": 2,
-        "code": "BADGE_INJECTION",
-        "name": "Badge Injection",
-        "description": "Award a surprise badge to boost motivation",
-        "target": "all_students"
-    },
-    3: {
-        "id": 3,
-        "code": "RANK_COMPARISON",
-        "name": "Rank Comparison",
-        "description": "Show 'You need X points to reach Top N' message",
-        "target": "skillful_students"
-    },
-    4: {
-        "id": 4,
-        "code": "EXTRA_GOALS",
-        "name": "Extra Goals",
-        "description": "Set additional achievable micro-goals",
-        "target": "struggling_students"
-    }
+    0: {"id": 0, "code": "STANDARD_XP",     "name": "Standard XP",     "description": "Award normal XP points for activity",          "target": "all_students"},
+    1: {"id": 1, "code": "MULTIPLIER_BOOST","name": "Multiplier Boost","description": "Apply XP multiplier (e.g., 2x, 3x) next activity","target": "all_students"},
+    2: {"id": 2, "code": "BADGE_INJECTION", "name": "Badge Injection", "description": "Award a surprise badge to boost motivation",     "target": "all_students"},
+    3: {"id": 3, "code": "RANK_COMPARISON", "name": "Rank Comparison", "description": "Show 'X points to reach Top N' message",         "target": "skillful_students"},
+    4: {"id": 4, "code": "EXTRA_GOALS",     "name": "Extra Goals",     "description": "Set additional achievable micro-goals",          "target": "struggling_students"}
 }
 
 # ==========================================
@@ -71,10 +50,8 @@ class DQN(nn.Module):
     def __init__(self, input_size=8, output_size=5):
         super(DQN, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
+            nn.Linear(input_size, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
             nn.Linear(64, output_size)
         )
 
@@ -99,17 +76,14 @@ class RLAgent:
 
     def choose_action(self, state_vector, validate_for_risk=None):
         state_tensor = torch.FloatTensor(state_vector)
-        
         if random.random() <= self.epsilon:
             action = random.randint(0, self.output_size - 1)
         else:
             with torch.no_grad():
                 q_values = self.model(state_tensor)
                 action = torch.argmax(q_values).item()
-        
         if validate_for_risk is not None:
             action = self._validate_action(action, validate_for_risk)
-        
         return action
     
     def _validate_action(self, action, risk_score):
@@ -124,28 +98,21 @@ class RLAgent:
     def replay(self, batch_size=32):
         if len(self.memory) < batch_size:
             return False
-        
         minibatch = random.sample(self.memory, batch_size)
-        
         for state, action, reward, next_state, done in minibatch:
             state_t = torch.FloatTensor(state)
             next_state_t = torch.FloatTensor(next_state)
-            
             target = reward
             if not done:
                 target = reward + self.gamma * torch.max(self.model(next_state_t)).item()
-            
             target_f = self.model(state_t).clone()
             target_f[action] = target
-            
             self.optimizer.zero_grad()
             loss = self.loss_fn(self.model(state_t), target_f)
             loss.backward()
             self.optimizer.step()
-        
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-        
         return True
 
     def get_q_values(self, state_vector):
@@ -158,7 +125,6 @@ class RLAgent:
 # HELPER FUNCTIONS
 # ==========================================
 def calculate_engagement(active_minutes, quiz_accuracy, modules_done, days_since_last_login):
-    """Calculate student engagement score."""
     time_score = min(active_minutes / 60.0, 1.0)
     accuracy_score = quiz_accuracy
     decay_factor = np.exp(-0.5 * days_since_last_login)
@@ -166,37 +132,24 @@ def calculate_engagement(active_minutes, quiz_accuracy, modules_done, days_since
     final_engagement = raw_engagement * decay_factor
     return float(final_engagement)
 
-
 def calculate_reward_score(recent_points, total_badges):
-    """Calculate reward/motivation score."""
     points_value = np.tanh(recent_points / 500.0)
     badge_value = 1.0 if total_badges > 0 else 0.0
     reward_score = (0.7 * points_value) + (0.3 * badge_value)
     return float(reward_score)
 
-
 def get_state_vector(user_data, risk_score):
-    """Build state vector for RL model."""
-    # One-hot encode level
     levels = ['Beginner', 'Intermediate', 'Expert']
     level_vec = [0, 0, 0]
     current_lvl = user_data.get('level', 'Beginner')
     if current_lvl in levels:
         level_vec[levels.index(current_lvl)] = 1
-    
-    # Normalize other features
     duration_norm = min(user_data.get('session_duration', 0) / 600, 1.5)
     quiz_norm = user_data.get('quiz_score', 0) / 100.0
-    consecutive = user_data.get('consecutive_completions', 1)
-    consecutive_norm = min(consecutive / 10.0, 1.0)
+    consecutive_norm = min(user_data.get('consecutive_completions', 1) / 10.0, 1.0)
     daily_xp_norm = np.tanh(user_data.get('daily_xp', 0) / 500.0)
-    
-    state_vector = np.array(
-        level_vec + [duration_norm, risk_score, quiz_norm, consecutive_norm, daily_xp_norm]
-    )
-    
+    state_vector = np.array(level_vec + [duration_norm, risk_score, quiz_norm, consecutive_norm, daily_xp_norm])
     return state_vector
-
 
 # ==========================================
 # INITIALIZE MODELS
@@ -205,7 +158,7 @@ print("=" * 50)
 print("🚀 Initializing SkillQuest RL API...")
 print("=" * 50)
 
-# Initialize Risk Model
+# Risk Model (synthetic training)
 print("📊 Training Risk Model...")
 np.random.seed(42)
 n_samples = 1000
@@ -219,18 +172,13 @@ risk_model = LogisticRegression()
 risk_model.fit(X_train, y_train)
 print(f"✅ Risk Model Ready (Accuracy: {risk_model.score(X_test, y_test):.2f})")
 
-# Initialize RL Agent
+# RL Agent
 agent = RLAgent()
 MODEL_PATH = 'trained_rl_agent.pth'
 
 if os.path.exists(MODEL_PATH):
     try:
-        # ✅ FIX: Added weights_only=False for PyTorch 2.6+
-        checkpoint = torch.load(
-            MODEL_PATH, 
-            map_location=torch.device('cpu'), 
-            weights_only=False
-        )
+        checkpoint = torch.load(MODEL_PATH, map_location=torch.device('cpu'), weights_only=False)
         agent.model.load_state_dict(checkpoint['model_state_dict'])
         agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         agent.epsilon = checkpoint.get('epsilon', 0.01)
@@ -244,56 +192,139 @@ else:
     print("⚠️ No trained model found. Using untrained agent.")
     print(f"   Place '{MODEL_PATH}' in the same folder as app.py")
 
-# Pending actions storage (for training feedback)
-pending_actions = {}
+# ==========================================
+# PENDING RECOMMENDATIONS (12h window)
+# ==========================================
+# Thread-safe in-memory store keyed by recommendation_id
+PENDING = {}
+PENDING_LOCK = threading.Lock()
+
+# Configurable via env vars
+TIMEOUT_HOURS = float(os.getenv("TIMEOUT_HOURS", "12"))
+LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "60"))
+POSITIVE_REWARD = float(os.getenv("POSITIVE_REWARD", "0.8"))  # reward when engaged
+NEGATIVE_REWARD = float(os.getenv("NEGATIVE_REWARD", "-0.5")) # reward when explicit "not engaged" feedback arrives (optional)
+TIMEOUT_PENALTY = float(os.getenv("TIMEOUT_PENALTY", "-2.0")) # penalty if no feedback in 12h
+
+# Auto-save settings (optional)
+AUTO_SAVE_INTERVAL = int(os.getenv("AUTO_SAVE_INTERVAL", "50"))
+training_updates = 0
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+def new_recommendation_id():
+    return str(uuid.uuid4())
+
+def add_pending(rec):
+    with PENDING_LOCK:
+        PENDING[rec["recommendation_id"]] = rec
+
+def pop_pending(recommendation_id):
+    with PENDING_LOCK:
+        return PENDING.pop(recommendation_id, None)
+
+def list_pending():
+    with PENDING_LOCK:
+        return list(PENDING.values())
+
+def save_checkpoint():
+    try:
+        memory_to_save = []
+        for state, action, reward, next_state, done in list(agent.memory)[-500:]:
+            memory_to_save.append((
+                state.tolist() if hasattr(state, 'tolist') else list(state),
+                action,
+                reward,
+                next_state.tolist() if hasattr(next_state, 'tolist') else list(next_state),
+                done
+            ))
+        checkpoint = {
+            'model_state_dict': agent.model.state_dict(),
+            'optimizer_state_dict': agent.optimizer.state_dict(),
+            'epsilon': agent.epsilon,
+            'memory': memory_to_save
+        }
+        torch.save(checkpoint, MODEL_PATH)
+        print(f"[RL] Auto-saved checkpoint to {MODEL_PATH}")
+        return True
+    except Exception as e:
+        print("[RL] Auto-save failed:", e)
+        return False
+
+def apply_model_update(context, action, reward, reason="feedback"):
+    agent.remember(context, action, reward, context, True)
+    trained = agent.replay(batch_size=32)
+    print(f"[RL] Update ({reason}) -> action={ACTION_SPACE[action]['code']} reward={reward} trained={trained}")
+    global training_updates
+    if trained:
+        training_updates += 1
+        if training_updates % AUTO_SAVE_INTERVAL == 0:
+            save_checkpoint()
+    return trained
+
+def check_timeouts_loop():
+    print("[TimeoutWorker] Started. Scanning for expired recommendations every", LOOP_INTERVAL_SECONDS, "seconds")
+    while True:
+        try:
+            now = utc_now()
+            expired = []
+            for rec in list_pending():
+                expires_at = datetime.fromisoformat(rec["expires_at"])
+                if now >= expires_at:
+                    expired.append(rec)
+            for rec in expired:
+                popped = pop_pending(rec["recommendation_id"])
+                if popped:
+                    apply_model_update(
+                        context=np.array(popped["state"]),
+                        action=popped["action_id"],
+                        reward=TIMEOUT_PENALTY,
+                        reason="timeout"
+                    )
+                    print(f"[TimeoutWorker] Penalized recommendation_id={popped['recommendation_id']} user_id={popped['user_id']}")
+        except Exception as e:
+            print("[TimeoutWorker] Error:", e)
+        time.sleep(LOOP_INTERVAL_SECONDS)
+
+# Start the timeout worker thread once
+threading.Thread(target=check_timeouts_loop, daemon=True).start()
 
 print("=" * 50)
 print("✅ API Ready!")
 print("=" * 50)
 
+# ==========================================
+# REQUEST AUTH (optional for write endpoints)
+# ==========================================
+def require_api_key():
+    if not API_KEY:
+        return True  # allow all for development if no API_KEY
+    key = request.headers.get("X-API-Key")
+    return key == API_KEY
 
 # ==========================================
 # API ENDPOINTS
 # ==========================================
-
 @app.route('/', methods=['GET'])
 def home():
-    """Home page with API documentation."""
     return jsonify({
         "service": "SkillQuest RL API",
-        "version": "1.0.0",
+        "version": "1.2.0",
         "status": "running",
         "endpoints": {
             "GET /": "This documentation",
             "GET /health": "Health check",
             "GET /actions": "List all available actions",
-            "POST /predict": "Get action prediction for a user",
-            "POST /feedback": "Record feedback and train model",
-            "GET /stats": "Get model statistics"
-        },
-        "example_request": {
-            "endpoint": "POST /predict",
-            "body": {
-                "user_id": 123,
-                "level": "Beginner",
-                "daily_xp": 100,
-                "active_minutes": 25,
-                "quiz_accuracy": 0.65,
-                "modules_done": 2,
-                "days_since_last_login": 1,
-                "recent_points": 300,
-                "total_badges": 1,
-                "session_duration": 180,
-                "quiz_score": 65,
-                "consecutive_completions": 3
-            }
+            "POST /predict": "Get action prediction (returns recommendation_id + expires_at)",
+            "POST /feedback": "Send only recommendation_id and engaged=true if the student engaged",
+            "GET /stats": "Get model statistics",
+            "POST /save": "Save current model checkpoint"
         }
     })
 
-
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint."""
     return jsonify({
         "status": "healthy",
         "model_loaded": os.path.exists(MODEL_PATH),
@@ -301,59 +332,26 @@ def health():
         "memory_size": len(agent.memory)
     })
 
-
 @app.route('/actions', methods=['GET'])
 def get_actions():
-    """List all available actions."""
     return jsonify({
         "success": True,
         "total_actions": len(ACTION_SPACE),
         "actions": list(ACTION_SPACE.values())
     })
 
-
 @app.route('/predict', methods=['POST'])
 def predict():
-    """
-    Get action prediction for a user.
-    
-    Required fields:
-        - user_id: Unique user identifier
-        - level: "Beginner", "Intermediate", or "Expert"
-        - active_minutes: Minutes spent learning today
-        - quiz_accuracy: Quiz accuracy (0.0 to 1.0)
-        - days_since_last_login: Days since last visit
-    
-    Optional fields:
-        - daily_xp: XP earned today (default: 0)
-        - modules_done: Modules completed today (default: 0)
-        - recent_points: Points earned recently (default: 0)
-        - total_badges: Total badges earned (default: 0)
-        - session_duration: Current session duration in seconds (default: 0)
-        - quiz_score: Latest quiz score 0-100 (default: 0)
-        - consecutive_completions: Consecutive modules completed (default: 1)
-    """
     try:
         data = request.get_json()
-        
         if not data:
-            return jsonify({
-                "success": False,
-                "error": "No JSON data provided. Send a POST request with JSON body."
-            }), 400
-        
-        # Validate required fields
+            return jsonify({"success": False, "error": "No JSON data provided."}), 400
+
         required_fields = ['user_id', 'level', 'active_minutes', 'quiz_accuracy', 'days_since_last_login']
         missing_fields = [f for f in required_fields if f not in data]
-        
         if missing_fields:
-            return jsonify({
-                "success": False,
-                "error": f"Missing required fields: {missing_fields}",
-                "required_fields": required_fields
-            }), 400
-        
-        # Extract user data with defaults
+            return jsonify({"success": False, "error": f"Missing required fields: {missing_fields}"}), 400
+
         user_id = data['user_id']
         user_data = {
             'level': data.get('level', 'Beginner'),
@@ -368,53 +366,47 @@ def predict():
             'quiz_score': data.get('quiz_score', 0),
             'consecutive_completions': data.get('consecutive_completions', 1)
         }
-        
-        # Calculate scores
+
         engagement = calculate_engagement(
             active_minutes=user_data['active_minutes'],
             quiz_accuracy=user_data['quiz_accuracy'],
             modules_done=user_data['modules_done'],
             days_since_last_login=user_data['days_since_last_login']
         )
-        
         reward_score = calculate_reward_score(
             recent_points=user_data['recent_points'],
             total_badges=user_data['total_badges']
         )
-        
-        # Calculate risk score
+
         student_features = np.array([[engagement, reward_score]])
         retention_prob = risk_model.predict_proba(student_features)[0][1]
         risk_score = 1.0 - retention_prob
-        
-        # Determine risk level
-        if risk_score > 0.6:
-            risk_level = "high"
-        elif risk_score > 0.35:
-            risk_level = "medium"
-        else:
-            risk_level = "low"
-        
-        # Get state vector
+        risk_level = "high" if risk_score > 0.6 else ("medium" if risk_score > 0.35 else "low")
+
         state_vector = get_state_vector(user_data, risk_score)
-        
-        # Predict action
         action_id = agent.choose_action(state_vector, validate_for_risk=risk_score)
         action = ACTION_SPACE[action_id]
-        
-        # Store pending action for feedback
-        pending_actions[user_id] = {
-            'state': state_vector.tolist(),
-            'action': action_id,
-            'risk_score': risk_score
-        }
-        
-        # Get Q-values for all actions
         q_values = agent.get_q_values(state_vector)
-        
+
+        # correlation + 12h expiry
+        recommendation_id = new_recommendation_id()
+        expires_at = (utc_now() + timedelta(hours=TIMEOUT_HOURS)).isoformat()
+
+        add_pending({
+            "recommendation_id": recommendation_id,
+            "user_id": user_id,
+            "action_id": action_id,
+            "state": state_vector.tolist(),
+            "created_at": utc_now().isoformat(),
+            "expires_at": expires_at
+        })
+
         return jsonify({
             "success": True,
             "user_id": user_id,
+            "recommendation_id": recommendation_id,
+            "expires_at": expires_at,
+            "window_hours": TIMEOUT_HOURS,
             "recommendation": {
                 "action_id": action['id'],
                 "action_code": action['code'],
@@ -429,145 +421,63 @@ def predict():
                 "risk_level": risk_level
             },
             "all_action_scores": {
-                ACTION_SPACE[i]['code']: round(q, 4) 
-                for i, q in enumerate(q_values)
+                ACTION_SPACE[i]['code']: round(q, 4) for i, q in enumerate(q_values)
             }
         })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
 
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/feedback', methods=['POST'])
 def feedback():
-    """
-    Record feedback when user returns (or doesn't).
-    This trains the model to improve over time.
-    
-    Required fields:
-        - user_id: Same user_id used in /predict
-        - user_returned: true if user came back, false if dropped out
-    
-    Optional fields:
-        - new_user_data: Updated user metrics (same format as /predict)
-    """
+    # Optional: protect write endpoint
+    if not require_api_key():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
     try:
         data = request.get_json()
-        
         if not data:
-            return jsonify({
-                "success": False,
-                "error": "No JSON data provided"
-            }), 400
-        
-        user_id = data.get('user_id')
-        user_returned = data.get('user_returned', False)
-        new_user_data = data.get('new_user_data', {})
-        
-        if user_id is None:
-            return jsonify({
-                "success": False,
-                "error": "user_id is required"
-            }), 400
-        
-        # Check for pending action
-        if user_id not in pending_actions:
-            return jsonify({
-                "success": False,
-                "error": f"No pending prediction found for user {user_id}. Call /predict first."
-            }), 400
-        
-        # Get pending action
-        pending = pending_actions.pop(user_id)
-        last_state = np.array(pending['state'])
-        last_action = pending['action']
-        old_risk = pending['risk_score']
-        
-        # Calculate reward
-        is_struggling = old_risk > 0.6
-        is_skilled = old_risk < 0.3
-        
-        # Base reward
-        if user_returned:
-            reward = 10.0
-        else:
-            reward = -5.0
-        
-        # Action-specific modifiers
-        if last_action == 0:  # Standard XP
-            reward += 1.0 if not is_struggling and not is_skilled else 0.5
-        elif last_action == 1:  # Multiplier Boost
-            reward += 4.0 if is_skilled else 2.0
-        elif last_action == 2:  # Badge Injection
-            reward += 4.0 if is_struggling else 2.0
-        elif last_action == 3:  # Rank Comparison
-            reward += 5.0 if is_skilled else (-8.0 if is_struggling else 1.0)
-        elif last_action == 4:  # Extra Goals
-            reward += 4.0 if is_struggling else 1.0
-        
-        # Calculate new state if user returned with new data
-        if user_returned and new_user_data:
-            new_engagement = calculate_engagement(
-                active_minutes=new_user_data.get('active_minutes', 0),
-                quiz_accuracy=new_user_data.get('quiz_accuracy', 0),
-                modules_done=new_user_data.get('modules_done', 0),
-                days_since_last_login=new_user_data.get('days_since_last_login', 0)
-            )
-            new_reward_score = calculate_reward_score(
-                recent_points=new_user_data.get('recent_points', 0),
-                total_badges=new_user_data.get('total_badges', 0)
-            )
-            student_features = np.array([[new_engagement, new_reward_score]])
-            new_risk = 1.0 - risk_model.predict_proba(student_features)[0][1]
-            new_state = get_state_vector(new_user_data, new_risk)
-            
-            # Bonus for risk reduction
-            if new_risk < old_risk:
-                reward += 5.0
-            
-            done = False
-        else:
-            new_state = last_state
-            new_risk = old_risk
-            done = True
-        
-        # Train the agent
-        agent.remember(last_state, last_action, reward, new_state, done)
-        trained = agent.replay(batch_size=32)
-        
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        recommendation_id = data.get('recommendation_id')
+        engaged = bool(data.get('engaged', True))  # default True; clients send only when engaged
+
+        if not recommendation_id:
+            return jsonify({"success": False, "error": "recommendation_id is required"}), 400
+
+        rec = pop_pending(recommendation_id)
+        if not rec:
+            return jsonify({"success": False, "error": "Unknown or already processed recommendation_id"}), 400
+
+        last_state = np.array(rec['state'])
+        last_action = rec['action_id']
+        user_id = rec['user_id']
+
+        # Reward policy: only engagement info
+        reward = POSITIVE_REWARD if engaged else NEGATIVE_REWARD
+
+        trained = apply_model_update(context=last_state, action=last_action, reward=reward, reason="feedback")
+
         return jsonify({
             "success": True,
             "feedback_recorded": True,
-            "training_performed": trained,
-            "details": {
-                "user_id": user_id,
-                "action_taken": last_action,
-                "action_name": ACTION_SPACE[last_action]['name'],
-                "user_returned": user_returned,
-                "reward_given": round(reward, 2),
-                "old_risk": round(old_risk, 4),
-                "new_risk": round(new_risk, 4),
-                "risk_improved": new_risk < old_risk
-            },
+            "user_id": user_id,
+            "recommendation_id": recommendation_id,
+            "engaged": engaged,
+            "reward": reward,
+            "action_taken": ACTION_SPACE[last_action]['code'],
             "model_stats": {
                 "memory_size": len(agent.memory),
-                "epsilon": round(agent.epsilon, 4)
-            }
+                "epsilon": round(agent.epsilon, 4),
+            },
+            "training_performed": trained
         })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
 
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/stats', methods=['GET'])
 def stats():
-    """Get current model statistics."""
     return jsonify({
         "success": True,
         "model": {
@@ -577,46 +487,26 @@ def stats():
             "memory_size": len(agent.memory),
             "memory_capacity": agent.memory.maxlen
         },
-        "pending_predictions": len(pending_actions),
-        "actions_available": len(ACTION_SPACE)
+        "pending_recommendations": len(list_pending()),
+        "actions_available": len(ACTION_SPACE),
+        "timeout_policy_hours": TIMEOUT_HOURS,
+        "positive_reward": POSITIVE_REWARD,
+        "negative_reward": NEGATIVE_REWARD,
+        "timeout_penalty": TIMEOUT_PENALTY,
+        "auto_save_interval": AUTO_SAVE_INTERVAL
     })
-
 
 @app.route('/save', methods=['POST'])
 def save_model():
-    """Save the current model state."""
-    try:
-        # Convert memory to JSON-serializable format
-        memory_to_save = []
-        for state, action, reward, next_state, done in list(agent.memory)[-500:]:
-            memory_to_save.append((
-                state.tolist() if hasattr(state, 'tolist') else list(state),
-                action,
-                reward,
-                next_state.tolist() if hasattr(next_state, 'tolist') else list(next_state),
-                done
-            ))
-        
-        checkpoint = {
-            'model_state_dict': agent.model.state_dict(),
-            'optimizer_state_dict': agent.optimizer.state_dict(),
-            'epsilon': agent.epsilon,
-            'memory': memory_to_save
-        }
-        torch.save(checkpoint, MODEL_PATH)
-        
-        return jsonify({
-            "success": True,
-            "message": f"Model saved to {MODEL_PATH}",
-            "memory_saved": len(memory_to_save)
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+    # Optional: protect write endpoint
+    if not require_api_key():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
 
+    try:
+        ok = save_checkpoint()
+        return jsonify({"success": ok, "message": f"Model saved to {MODEL_PATH}" if ok else "Save failed"}), (200 if ok else 500)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 # ==========================================
 # RUN THE SERVER
@@ -628,13 +518,12 @@ if __name__ == '__main__':
     print("   GET  /           - API Documentation")
     print("   GET  /health     - Health Check")
     print("   GET  /actions    - List All Actions")
-    print("   POST /predict    - Get Action Prediction")
-    print("   POST /feedback   - Record Feedback & Train")
+    print("   POST /predict    - Get Action Prediction (returns recommendation_id)")
+    print("   POST /feedback   - Record Feedback (send recommendation_id + engaged)")
     print("   GET  /stats      - Model Statistics")
     print("   POST /save       - Save Model")
     print("=" * 50)
     port = int(os.environ.get('PORT', 8000))
     print(f"\n🌐 Starting server at http://localhost:{port}")
     print("=" * 50 + "\n")
-    
     app.run(host='0.0.0.0', port=port, debug=False)
