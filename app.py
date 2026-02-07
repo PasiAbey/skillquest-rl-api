@@ -17,11 +17,13 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 import os
 
-# NEW: imports for recommendation correlation, timeouts, and threading
+# imports for recommendation correlation and timeouts
 import uuid
-import threading
-import time
+import json
 from datetime import datetime, timedelta, timezone
+
+# NEW: Redis import
+import redis
 
 # ==========================================
 # FLASK APP SETUP
@@ -31,6 +33,29 @@ CORS(app)  # Allow all origins (for development)
 
 # Optional API key protection for write endpoints (feedback/save)
 API_KEY = os.getenv("API_KEY")  # set in Azure as a secret if you want to restrict feedback
+
+# ==========================================
+# REDIS CONNECTION
+# ==========================================
+REDIS_HOST = os.getenv("REDIS_HOST", "skillquest-cache.redis.cache.windows.net")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6380"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+
+# Connect to Azure Redis (SSL required)
+try:
+    redis_client = redis.StrictRedis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        password=REDIS_PASSWORD,
+        ssl=True,
+        decode_responses=True
+    )
+    redis_client.ping()  # Test connection
+    print(f"✅ Connected to Redis: {REDIS_HOST}:{REDIS_PORT}")
+except Exception as e:
+    print(f"⚠️ Redis connection failed: {e}")
+    print("⚠️ Falling back to in-memory storage (not recommended for production)")
+    redis_client = None
 
 # ==========================================
 # ACTION SPACE DEFINITION
@@ -173,40 +198,39 @@ risk_model.fit(X_train, y_train)
 print(f"✅ Risk Model Ready (Accuracy: {risk_model.score(X_test, y_test):.2f})")
 
 # RL Agent
+print("🤖 Initializing RL Agent...")
 agent = RLAgent()
-MODEL_PATH = 'trained_rl_agent.pth'
+MODEL_PATH = os.getenv("MODEL_PATH", "trained_rl_agent.pth")
 
 if os.path.exists(MODEL_PATH):
     try:
-        checkpoint = torch.load(MODEL_PATH, map_location=torch.device('cpu'), weights_only=False)
+        checkpoint = torch.load(MODEL_PATH, map_location=torch.device('cpu'))
         agent.model.load_state_dict(checkpoint['model_state_dict'])
         agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         agent.epsilon = checkpoint.get('epsilon', 0.01)
-        for exp in checkpoint.get('memory', []):
-            agent.memory.append(exp)
-        print(f"✅ RL Agent Loaded (Epsilon: {agent.epsilon:.3f}, Memory: {len(agent.memory)})")
+        if 'memory' in checkpoint:
+            for item in checkpoint['memory']:
+                state, action, reward, next_state, done = item
+                agent.memory.append((np.array(state), action, reward, np.array(next_state), done))
+        print(f"✅ Loaded model from {MODEL_PATH}")
+        print(f"   Epsilon: {agent.epsilon:.4f}, Memory: {len(agent.memory)} experiences")
     except Exception as e:
-        print(f"⚠️ Error loading model: {e}")
-        print("   Using untrained agent instead.")
+        print(f"⚠️ Could not load model: {e}")
+        print("   Starting with fresh model")
 else:
-    print("⚠️ No trained model found. Using untrained agent.")
+    print(f"⚠️ No saved model found at {MODEL_PATH}")
     print(f"   Place '{MODEL_PATH}' in the same folder as app.py")
 
 # ==========================================
-# PENDING RECOMMENDATIONS (12h window)
+# PENDING RECOMMENDATIONS (Redis-backed)
 # ==========================================
-# Thread-safe in-memory store keyed by recommendation_id
-PENDING = {}
-PENDING_LOCK = threading.Lock()
-
 # Configurable via env vars
 TIMEOUT_HOURS = float(os.getenv("TIMEOUT_HOURS", "12"))
-LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "60"))
-POSITIVE_REWARD = float(os.getenv("POSITIVE_REWARD", "0.8"))  # reward when engaged
-NEGATIVE_REWARD = float(os.getenv("NEGATIVE_REWARD", "-0.5")) # reward when explicit "not engaged" feedback arrives (optional)
-TIMEOUT_PENALTY = float(os.getenv("TIMEOUT_PENALTY", "-2.0")) # penalty if no feedback in 12h
+POSITIVE_REWARD = float(os.getenv("POSITIVE_REWARD", "0.8"))
+NEGATIVE_REWARD = float(os.getenv("NEGATIVE_REWARD", "-0.5"))
+TIMEOUT_PENALTY = float(os.getenv("TIMEOUT_PENALTY", "-2.0"))
 
-# Auto-save settings (optional)
+# Auto-save settings
 AUTO_SAVE_INTERVAL = int(os.getenv("AUTO_SAVE_INTERVAL", "50"))
 training_updates = 0
 
@@ -217,16 +241,61 @@ def new_recommendation_id():
     return str(uuid.uuid4())
 
 def add_pending(rec):
-    with PENDING_LOCK:
-        PENDING[rec["recommendation_id"]] = rec
+    """Store recommendation in Redis with automatic expiry"""
+    if redis_client:
+        key = f"pending:{rec['recommendation_id']}"
+        ttl_seconds = int(TIMEOUT_HOURS * 3600)  # Convert hours to seconds
+        redis_client.setex(
+            name=key,
+            time=ttl_seconds,
+            value=json.dumps(rec)
+        )
+        print(f"[Redis] Stored {key} with TTL={ttl_seconds}s")
+    else:
+        # Fallback to in-memory (not recommended)
+        if not hasattr(add_pending, 'memory'):
+            add_pending.memory = {}
+        add_pending.memory[rec['recommendation_id']] = rec
 
 def pop_pending(recommendation_id):
-    with PENDING_LOCK:
-        return PENDING.pop(recommendation_id, None)
+    """Get and delete recommendation from Redis"""
+    if redis_client:
+        key = f"pending:{recommendation_id}"
+        data = redis_client.get(key)
+        if data:
+            redis_client.delete(key)
+            return json.loads(data)
+        return None
+    else:
+        # Fallback to in-memory
+        if hasattr(add_pending, 'memory'):
+            return add_pending.memory.pop(recommendation_id, None)
+        return None
 
 def list_pending():
-    with PENDING_LOCK:
-        return list(PENDING.values())
+    """List all pending recommendations"""
+    if redis_client:
+        keys = redis_client.keys("pending:*")
+        results = []
+        for key in keys:
+            data = redis_client.get(key)
+            if data:
+                results.append(json.loads(data))
+        return results
+    else:
+        # Fallback to in-memory
+        if hasattr(add_pending, 'memory'):
+            return list(add_pending.memory.values())
+        return []
+
+def count_pending():
+    """Count pending recommendations"""
+    if redis_client:
+        return len(redis_client.keys("pending:*"))
+    else:
+        if hasattr(add_pending, 'memory'):
+            return len(add_pending.memory)
+        return 0
 
 def save_checkpoint():
     try:
@@ -263,33 +332,6 @@ def apply_model_update(context, action, reward, reason="feedback"):
             save_checkpoint()
     return trained
 
-def check_timeouts_loop():
-    print("[TimeoutWorker] Started. Scanning for expired recommendations every", LOOP_INTERVAL_SECONDS, "seconds")
-    while True:
-        try:
-            now = utc_now()
-            expired = []
-            for rec in list_pending():
-                expires_at = datetime.fromisoformat(rec["expires_at"])
-                if now >= expires_at:
-                    expired.append(rec)
-            for rec in expired:
-                popped = pop_pending(rec["recommendation_id"])
-                if popped:
-                    apply_model_update(
-                        context=np.array(popped["state"]),
-                        action=popped["action_id"],
-                        reward=TIMEOUT_PENALTY,
-                        reason="timeout"
-                    )
-                    print(f"[TimeoutWorker] Penalized recommendation_id={popped['recommendation_id']} user_id={popped['user_id']}")
-        except Exception as e:
-            print("[TimeoutWorker] Error:", e)
-        time.sleep(LOOP_INTERVAL_SECONDS)
-
-# Start the timeout worker thread once
-threading.Thread(target=check_timeouts_loop, daemon=True).start()
-
 print("=" * 50)
 print("✅ API Ready!")
 print("=" * 50)
@@ -310,8 +352,9 @@ def require_api_key():
 def home():
     return jsonify({
         "service": "SkillQuest RL API",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "status": "running",
+        "storage": "Redis" if redis_client else "In-Memory",
         "endpoints": {
             "GET /": "This documentation",
             "GET /health": "Health check",
@@ -325,11 +368,21 @@ def home():
 
 @app.route('/health', methods=['GET'])
 def health():
+    redis_status = "connected"
+    if redis_client:
+        try:
+            redis_client.ping()
+        except:
+            redis_status = "disconnected"
+    else:
+        redis_status = "not configured"
+    
     return jsonify({
         "status": "healthy",
         "model_loaded": os.path.exists(MODEL_PATH),
         "agent_epsilon": agent.epsilon,
-        "memory_size": len(agent.memory)
+        "memory_size": len(agent.memory),
+        "redis_status": redis_status
     })
 
 @app.route('/actions', methods=['GET'])
@@ -367,28 +420,30 @@ def predict():
             'consecutive_completions': data.get('consecutive_completions', 1)
         }
 
+        # Calculate scores
         engagement = calculate_engagement(
-            active_minutes=user_data['active_minutes'],
-            quiz_accuracy=user_data['quiz_accuracy'],
-            modules_done=user_data['modules_done'],
-            days_since_last_login=user_data['days_since_last_login']
+            user_data['active_minutes'],
+            user_data['quiz_accuracy'],
+            user_data['modules_done'],
+            user_data['days_since_last_login']
         )
         reward_score = calculate_reward_score(
-            recent_points=user_data['recent_points'],
-            total_badges=user_data['total_badges']
+            user_data['recent_points'],
+            user_data['total_badges']
         )
 
-        student_features = np.array([[engagement, reward_score]])
-        retention_prob = risk_model.predict_proba(student_features)[0][1]
-        risk_score = 1.0 - retention_prob
-        risk_level = "high" if risk_score > 0.6 else ("medium" if risk_score > 0.35 else "low")
+        # Predict risk
+        risk_input = np.array([[engagement, reward_score]])
+        risk_proba = risk_model.predict_proba(risk_input)[0]
+        risk_score = float(risk_proba[0])  # probability of disengagement
+        risk_level = "high" if risk_score > 0.6 else ("medium" if risk_score > 0.3 else "low")
 
         state_vector = get_state_vector(user_data, risk_score)
         action_id = agent.choose_action(state_vector, validate_for_risk=risk_score)
         action = ACTION_SPACE[action_id]
         q_values = agent.get_q_values(state_vector)
 
-        # correlation + 12h expiry
+        # correlation + expiry (Redis handles TTL automatically)
         recommendation_id = new_recommendation_id()
         expires_at = (utc_now() + timedelta(hours=TIMEOUT_HOURS)).isoformat()
 
@@ -407,6 +462,7 @@ def predict():
             "recommendation_id": recommendation_id,
             "expires_at": expires_at,
             "window_hours": TIMEOUT_HOURS,
+            "storage": "Redis" if redis_client else "In-Memory",
             "recommendation": {
                 "action_id": action['id'],
                 "action_code": action['code'],
@@ -478,6 +534,15 @@ def feedback():
 
 @app.route('/stats', methods=['GET'])
 def stats():
+    redis_status = "connected"
+    if redis_client:
+        try:
+            redis_client.ping()
+        except:
+            redis_status = "disconnected"
+    else:
+        redis_status = "not configured"
+    
     return jsonify({
         "success": True,
         "model": {
@@ -487,7 +552,11 @@ def stats():
             "memory_size": len(agent.memory),
             "memory_capacity": agent.memory.maxlen
         },
-        "pending_recommendations": len(list_pending()),
+        "storage": {
+            "type": "Redis" if redis_client else "In-Memory",
+            "status": redis_status,
+            "pending_recommendations": count_pending()
+        },
         "actions_available": len(ACTION_SPACE),
         "timeout_policy_hours": TIMEOUT_HOURS,
         "positive_reward": POSITIVE_REWARD,
@@ -522,6 +591,8 @@ if __name__ == '__main__':
     print("   POST /feedback   - Record Feedback (send recommendation_id + engaged)")
     print("   GET  /stats      - Model Statistics")
     print("   POST /save       - Save Model")
+    print("=" * 50)
+    print(f"   Storage: {'Redis ✅' if redis_client else 'In-Memory ⚠️'}")
     print("=" * 50)
     port = int(os.environ.get('PORT', 8000))
     print(f"\n🌐 Starting server at http://localhost:{port}")
